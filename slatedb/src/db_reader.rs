@@ -24,7 +24,7 @@ use {
         prefix_extractor::PrefixExtractor,
         reader::{DbStateReader, Reader, ScanContext},
         tablestore::TableStore,
-        types::KeyValue,
+        types::{KeyValue, RowEntry},
         utils::IdGenerator,
         wal::slatedb::store::WalTableStore,
         wal::WalReader as WalReaderTrait,
@@ -326,6 +326,41 @@ impl DbReaderInner {
         let db_state = Arc::clone(&self.state.read());
         self.reader
             .get_key_value_with_options(key, options, db_state.as_ref(), None, None)
+            .await
+    }
+
+    async fn multi_get_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
+        let entries = self.multi_get_entries_with_options(keys, options).await?;
+        Ok(entries
+            .into_iter()
+            .map(|entry| entry.and_then(|entry| entry.value.as_bytes()))
+            .collect())
+    }
+
+    async fn multi_get_key_value_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
+        let entries = self.multi_get_entries_with_options(keys, options).await?;
+        Ok(entries.into_iter().map(|e| e.map(KeyValue::from)).collect())
+    }
+
+    async fn multi_get_entries_with_options<K: AsRef<[u8]>>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
+        self.check_closed()?;
+        let key_bytes: Vec<Bytes> =
+            keys.iter().map(|k| Bytes::copy_from_slice(k.as_ref())).collect();
+        let db_state = Arc::clone(&self.state.read());
+        self.reader
+            .multi_get_with_options(&key_bytes, options, db_state.as_ref(), None, None)
             .await
     }
 
@@ -1159,6 +1194,49 @@ impl DbReader {
         Ok(kv)
     }
 
+    /// Get multiple values from the reader in one snapshot-consistent batch.
+    pub async fn multi_get<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.multi_get_with_options(keys, &ReadOptions::default())
+            .await
+    }
+
+    /// Get multiple values from the reader in one batch with custom read options.
+    pub async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        self.inner
+            .multi_get_with_options(keys, options)
+            .await
+            .map_err(Into::into)
+    }
+
+    /// Get multiple key-value pairs from the reader in one batch.
+    pub async fn multi_get_key_value<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+    ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
+        self.multi_get_key_value_with_options(keys, &ReadOptions::default())
+            .await
+    }
+
+    /// Get multiple key-value pairs from the reader in one batch with custom
+    /// read options.
+    pub async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
+        self.inner
+            .multi_get_key_value_with_options(keys, options)
+            .await
+            .map_err(crate::Error::from)
+    }
+
     /// Scan a range of keys using the default scan options.
     ///
     /// returns a `DbIterator`
@@ -1397,6 +1475,22 @@ impl DbReadOps for DbReader {
         options: &ReadOptions,
     ) -> Result<Option<KeyValue>, crate::Error> {
         DbReader::get_key_value_with_options(self, key, options).await
+    }
+
+    async fn multi_get_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<Bytes>>, crate::Error> {
+        DbReader::multi_get_with_options(self, keys, options).await
+    }
+
+    async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Send + Sync>(
+        &self,
+        keys: &[K],
+        options: &ReadOptions,
+    ) -> Result<Vec<Option<KeyValue>>, crate::Error> {
+        DbReader::multi_get_key_value_with_options(self, keys, options).await
     }
 
     async fn scan_with_options<T>(

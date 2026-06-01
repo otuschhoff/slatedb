@@ -187,6 +187,27 @@ enum FilterState {
     Negative,
 }
 
+/// AND across all filters: returns `true` iff every filter thinks `query`
+/// might match. An empty `filters` slice means no filter is configured for the
+/// SST; callers treat that as "might match" (do not skip). Shared by the
+/// single-key [`FilterEvaluator`] and the batched `multi_get` path
+/// ([`crate::multi_sst`]).
+pub(crate) fn all_filters_might_match(
+    filters: &[NamedFilter],
+    query: &FilterQuery,
+    sst_id: SsTableId,
+    sst_level: Option<&SstTraceLevel>,
+    read_trace: &ReadTrace,
+) -> bool {
+    filters.iter().all(|filter| {
+        let span = read_trace.new_evaluate_filter_span(sst_id, sst_level, &filter.name);
+        let _guard = span.enter();
+        let result = filter.filter.might_match(query);
+        span.record("result", result);
+        result
+    })
+}
+
 struct FilterEvaluator {
     query: FilterQuery,
     db_stats: Option<DbStats>,
@@ -259,9 +280,8 @@ impl FilterEvaluator {
         // AND logic: if any filter says the key is NOT present, filter it out.
         // All filters reaching here are decoded. TableStore::read_filters
         // resolves any raw cache entries before returning.
-        let might_match = filters
-            .iter()
-            .all(|nf| self.filter_might_match(nf, sst_id, sst_level, read_trace));
+        let might_match =
+            all_filters_might_match(filters, &self.query, sst_id, sst_level, read_trace);
 
         if might_match {
             if let Some(stats) = &self.db_stats {
@@ -274,20 +294,6 @@ impl FilterEvaluator {
             }
             self.state = FilterState::Negative;
         }
-    }
-
-    fn filter_might_match(
-        &self,
-        filter: &NamedFilter,
-        sst_id: SsTableId,
-        sst_level: Option<&SstTraceLevel>,
-        read_trace: &ReadTrace,
-    ) -> bool {
-        let span = read_trace.new_evaluate_filter_span(sst_id, sst_level, &filter.name);
-        let _guard = span.enter();
-        let result = filter.filter.might_match(&self.query);
-        span.record("result", result);
-        result
     }
 
     fn positives_counter<'a>(&self, stats: &'a DbStats) -> &'a Arc<dyn CounterFn> {
