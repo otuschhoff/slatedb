@@ -148,7 +148,6 @@ async fn read_metadata(
         .await?;
     Ok((index, filters))
 }
-
 /// Step 2: prune keys by visible range and bloom filter, then map each survivor
 /// to the block range that may hold its versions. Uses the same
 /// `partitions_covering_range` the single-key path uses, so a key whose versions

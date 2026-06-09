@@ -22,7 +22,9 @@ use {
         oracle::DbReaderOracle,
         paths::PathResolver,
         prefix_extractor::PrefixExtractor,
-        reader::{DbStateReader, Reader, ScanContext},
+        reader::{
+            entries_to_key_values, entries_to_values, DbStateReader, Reader, ScanContext,
+        },
         tablestore::TableStore,
         types::{KeyValue, RowEntry},
         utils::IdGenerator,
@@ -329,38 +331,33 @@ impl DbReaderInner {
             .await
     }
 
-    async fn multi_get_with_options<K: AsRef<[u8]>>(
+    async fn multi_get_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
         options: &ReadOptions,
     ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
         let entries = self.multi_get_entries_with_options(keys, options).await?;
-        Ok(entries
-            .into_iter()
-            .map(|entry| entry.and_then(|entry| entry.value.as_bytes()))
-            .collect())
+        Ok(entries_to_values(entries))
     }
 
-    async fn multi_get_key_value_with_options<K: AsRef<[u8]>>(
+    async fn multi_get_key_value_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
         options: &ReadOptions,
     ) -> Result<Vec<Option<KeyValue>>, SlateDBError> {
         let entries = self.multi_get_entries_with_options(keys, options).await?;
-        Ok(entries.into_iter().map(|e| e.map(KeyValue::from)).collect())
+        Ok(entries_to_key_values(entries))
     }
 
-    async fn multi_get_entries_with_options<K: AsRef<[u8]>>(
+    async fn multi_get_entries_with_options<K: AsRef<[u8]> + Sync>(
         &self,
         keys: &[K],
         options: &ReadOptions,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
         self.check_closed()?;
-        let key_bytes: Vec<Bytes> =
-            keys.iter().map(|k| Bytes::copy_from_slice(k.as_ref())).collect();
         let db_state = Arc::clone(&self.state.read());
         self.reader
-            .multi_get_with_options(&key_bytes, options, db_state.as_ref(), None, None)
+            .multi_get_with_options(keys, options, db_state.as_ref(), None, None)
             .await
     }
 
