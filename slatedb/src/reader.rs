@@ -918,15 +918,15 @@ fn build_sst_work(
         if resolved[u] {
             continue;
         }
-        let segment = match core.select_segments(&BytesRange::from_slice(key.as_ref()..=key.as_ref()))
-        {
-            None => core.default_segment(),
-            Some(segments) => match segments.last() {
-                Some(segment) => (*segment).clone(),
-                // Configured but no segment covers this key: no on-disk data.
-                None => continue,
-            },
-        };
+        let segment =
+            match core.select_segments(&BytesRange::from_slice(key.as_ref()..=key.as_ref())) {
+                None => core.default_segment(),
+                Some(segments) => match segments.last() {
+                    Some(segment) => (*segment).clone(),
+                    // Configured but no segment covers this key: no on-disk data.
+                    None => continue,
+                },
+            };
         trees
             .entry(Arc::as_ptr(&segment.tree) as usize)
             .or_insert_with(|| (segment.tree.clone(), segment.prefix.clone(), Vec::new()))

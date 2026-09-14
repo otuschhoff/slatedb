@@ -80,27 +80,14 @@ pub(crate) async fn read_sst_for_keys(
     }
     let handle = &view.sst;
 
-    let (index, filters) = read_metadata(
-        handle,
-        table_store,
-        options,
-        read_trace,
-        sst_level,
-    )
-    .await?;
+    let (index, filters) =
+        read_metadata(handle, table_store, options, read_trace, sst_level).await?;
     if index.borrow().block_meta().is_empty() {
         return Ok(Vec::new());
     }
 
     let candidates = plan_candidates(
-        view,
-        keys,
-        &index,
-        &filters,
-        options,
-        read_trace,
-        sst_level,
-        db_stats,
+        view, keys, &index, &filters, options, read_trace, sst_level, db_stats,
     );
     if candidates.is_empty() {
         return Ok(Vec::new());
@@ -179,13 +166,7 @@ fn plan_candidates(
         if !filters.is_empty() {
             let query =
                 FilterQuery::point(pk.key.clone()).with_context(options.filter_context.clone());
-            if !all_filters_might_match(
-                filters,
-                &query,
-                view.sst.id,
-                Some(sst_level),
-                read_trace,
-            ) {
+            if !all_filters_might_match(filters, &query, view.sst.id, Some(sst_level), read_trace) {
                 if let Some(stats) = db_stats {
                     stats.sst_filter_point_negatives.increment(1);
                 }

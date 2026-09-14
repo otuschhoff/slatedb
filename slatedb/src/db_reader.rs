@@ -22,9 +22,7 @@ use {
         oracle::DbReaderOracle,
         paths::PathResolver,
         prefix_extractor::PrefixExtractor,
-        reader::{
-            entries_to_key_values, entries_to_values, DbStateReader, Reader, ScanContext,
-        },
+        reader::{entries_to_key_values, entries_to_values, DbStateReader, Reader, ScanContext},
         tablestore::TableStore,
         types::{KeyValue, RowEntry},
         utils::IdGenerator,
