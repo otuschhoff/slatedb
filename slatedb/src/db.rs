@@ -339,6 +339,21 @@ impl DbInner {
     #[inline]
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
         let mut backpressure_timer = None;
+        let result = self.apply_backpressure_loop(&mut backpressure_timer).await;
+        if let Some(timer) = backpressure_timer {
+            timer.complete(if result.is_ok() {
+                crate::db_stats::LifecycleOutcome::Success
+            } else {
+                crate::db_stats::LifecycleOutcome::Failure
+            });
+        }
+        result
+    }
+
+    async fn apply_backpressure_loop(
+        &self,
+        backpressure_timer: &mut Option<crate::db_stats::ActiveDurationGuard>,
+    ) -> Result<(), SlateDBError> {
         loop {
             self.check_closed()?;
             let wal_status = self.wal_observer.status()?;
@@ -376,12 +391,8 @@ impl DbInner {
             );
 
             if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
-                backpressure_timer.get_or_insert_with(|| {
-                    crate::db_stats::ActiveDurationGuard::new(
-                        self.db_stats.backpressure_waiters.clone(),
-                        self.db_stats.backpressure_wait_seconds.clone(),
-                    )
-                });
+                backpressure_timer
+                    .get_or_insert_with(|| self.db_stats.backpressure_lifecycle.start());
                 self.db_stats.backpressure_count.increment(1);
                 warn!(
                     "unflushed WAL and memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}]",
@@ -433,6 +444,7 @@ impl DbInner {
                     result = await_memtable_uploaded => result?,
                     result = await_flush_wal => result?,
                     _ = timeout_fut => {
+                        self.db_stats.backpressure_timeout_count.increment(1);
                         warn!("backpressure timeout: waited 30s, no memtable/WAL flushed yet");
                     }
                 };
@@ -5616,6 +5628,15 @@ mod tests {
         })
         .await
         .expect("timed out waiting for backpressure to be applied");
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::BACKPRESSURE_WAITERS),
+            Some(1)
+        );
+        assert!(lookup_metric(
+            &metrics_recorder,
+            crate::db_stats::BACKPRESSURE_OLDEST_ACTIVE_STARTED_UNIX_MILLIS
+        )
+        .is_some_and(|started| started > 0));
 
         // Simulate the DB being fenced while the writer is already parked in
         // backpressure.
@@ -5649,6 +5670,24 @@ mod tests {
         assert_eq!(
             lookup_metric(&metrics_recorder, crate::db_stats::BACKPRESSURE_WAITERS),
             Some(0)
+        );
+        assert_eq!(
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::BACKPRESSURE_OLDEST_ACTIVE_STARTED_UNIX_MILLIS
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric_with_labels(
+                &metrics_recorder,
+                crate::db_stats::BACKPRESSURE_OUTCOME_COUNT,
+                &[(
+                    crate::db_stats::OUTCOME_LABEL,
+                    crate::db_stats::OUTCOME_FAILURE
+                )]
+            ),
+            Some(1)
         );
         let snapshot = metrics_recorder.snapshot();
         let metrics = snapshot.by_name(crate::db_stats::BACKPRESSURE_WAIT_SECONDS);
@@ -10050,6 +10089,46 @@ mod tests {
                 crate::db_stats::BATCH_WRITE_SERVICE_ACTIVE
             ),
             Some(0)
+        );
+        assert_eq!(
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::BATCH_WRITE_SERVICE_OLDEST_ACTIVE_STARTED_UNIX_MILLIS
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric_with_labels(
+                &metrics_recorder,
+                crate::db_stats::BATCH_WRITE_SERVICE_OUTCOME_COUNT,
+                &[(
+                    crate::db_stats::OUTCOME_LABEL,
+                    crate::db_stats::OUTCOME_SUCCESS
+                )]
+            ),
+            Some(2)
+        );
+        assert_eq!(
+            lookup_metric_with_labels(
+                &metrics_recorder,
+                crate::db_stats::BATCH_WRITE_SERVICE_OUTCOME_COUNT,
+                &[(
+                    crate::db_stats::OUTCOME_LABEL,
+                    crate::db_stats::OUTCOME_FAILURE
+                )]
+            ),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric_with_labels(
+                &metrics_recorder,
+                crate::db_stats::BATCH_WRITE_QUEUE_OUTCOME_COUNT,
+                &[(
+                    crate::db_stats::OUTCOME_LABEL,
+                    crate::db_stats::QUEUE_OUTCOME_PROCESSED
+                )]
+            ),
+            Some(2)
         );
         for metric_name in [
             crate::db_stats::BATCH_WRITE_QUEUE_WAIT_SECONDS,

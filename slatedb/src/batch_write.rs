@@ -128,10 +128,11 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                     .db_stats
                     .batch_write_queue_wait_seconds
                     .record(enqueued_at.elapsed().as_secs_f64());
-                let _service_timer = crate::db_stats::ActiveDurationGuard::new(
-                    self.db_inner.db_stats.batch_write_service_active.clone(),
-                    self.db_inner.db_stats.batch_write_service_seconds.clone(),
-                );
+                self.db_inner
+                    .db_stats
+                    .batch_write_queue_processed
+                    .increment(1);
+                let service_timer = self.db_inner.db_stats.batch_write_service_lifecycle.start();
                 let wal_writer = self.wal_writer.as_deref_mut();
                 let result = self
                     .db_inner
@@ -139,10 +140,16 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                     .await;
                 match result {
                     Ok(write_result) => {
+                        service_timer.complete(if write_result.is_ok() {
+                            crate::db_stats::LifecycleOutcome::Success
+                        } else {
+                            crate::db_stats::LifecycleOutcome::Failure
+                        });
                         let _ = done.send(write_result);
                         Ok(())
                     }
                     Err(error) => {
+                        service_timer.complete(crate::db_stats::LifecycleOutcome::Failure);
                         let _ = done.send(Err(error.clone()));
                         Err(error)
                     }
@@ -176,6 +183,11 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
         mut messages: BoxStream<'async_trait, BatchWriterMessage>,
         result: Result<(), SlateDBError>,
     ) -> Result<(), SlateDBError> {
+        let queue_outcome = if matches!(result, Ok(()) | Err(SlateDBError::Closed)) {
+            self.db_inner.db_stats.batch_write_queue_cancelled.clone()
+        } else {
+            self.db_inner.db_stats.batch_write_queue_failed.clone()
+        };
         let error = result.clone().err().unwrap_or(SlateDBError::Closed);
         while let Some(msg) = messages.next().await {
             match msg {
@@ -185,6 +197,7 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                         .db_stats
                         .batch_write_queue_wait_seconds
                         .record(req.enqueued_at.elapsed().as_secs_f64());
+                    queue_outcome.increment(1);
                     let _ = req.done.send(Err(error.clone()));
                 }
                 BatchWriterMessage::Flush(flush_msg) => {
@@ -531,6 +544,9 @@ mod tests {
     use crate::wal::test_utils::FakeWalWriter;
     use crate::wal::{WalError, WalObserver, WalStatus};
     use crate::Db;
+    use slatedb_common::metrics::{
+        lookup_metric, lookup_metric_with_labels, DefaultMetricsRecorder,
+    };
 
     enum FailingWalOperation {
         Append,
@@ -651,6 +667,61 @@ mod tests {
             Err(error) => error,
         };
         assert!(matches!(caller_error, SlateDBError::Fenced));
+
+        db.close().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn test_cleanup_settles_failed_queued_write() {
+        let object_store = Arc::new(InMemory::new());
+        let metrics_recorder = Arc::new(DefaultMetricsRecorder::new());
+        let db = Db::builder(
+            "/tmp/test_cleanup_settles_failed_queued_write",
+            object_store,
+        )
+        .with_metrics_recorder(metrics_recorder.clone())
+        .build()
+        .await
+        .unwrap();
+        let mut handler = WriteBatchEventHandler::new(db.inner.clone(), None);
+        let mut batch = WriteBatch::new();
+        batch.put(b"key", b"value");
+        let (msg, done_rx) = test_message(batch, WriteOptions::default());
+        db.inner.db_stats.batch_write_queue_depth.increment(1);
+
+        handler
+            .cleanup(
+                futures::stream::iter(vec![msg]).boxed(),
+                Err(SlateDBError::Fenced),
+            )
+            .await
+            .unwrap();
+
+        assert!(matches!(done_rx.await.unwrap(), Err(SlateDBError::Fenced)));
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::BATCH_WRITE_QUEUE_DEPTH),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric_with_labels(
+                &metrics_recorder,
+                crate::db_stats::BATCH_WRITE_QUEUE_OUTCOME_COUNT,
+                &[(
+                    crate::db_stats::OUTCOME_LABEL,
+                    crate::db_stats::OUTCOME_FAILURE
+                )]
+            ),
+            Some(1)
+        );
+        let snapshot = metrics_recorder.snapshot();
+        assert!(matches!(
+            snapshot
+                .by_name(crate::db_stats::BATCH_WRITE_QUEUE_WAIT_SECONDS)
+                .first()
+                .unwrap()
+                .value,
+            slatedb_common::metrics::MetricValue::Histogram { count: 1, .. }
+        ));
 
         db.close().await.unwrap();
     }
