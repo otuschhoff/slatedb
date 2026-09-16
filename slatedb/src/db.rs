@@ -319,21 +319,26 @@ impl DbInner {
         }
 
         let (tx, rx) = tokio::sync::oneshot::channel();
+        self.maybe_apply_backpressure().await?;
         let batch_msg = BatchWriterMessage::WriteBatch(WriteBatchRequest {
             batch,
             options: options.clone(),
             done: tx,
             txn,
+            enqueued_at: std::time::Instant::now(),
         });
-
-        self.maybe_apply_backpressure().await?;
-        self.write_notifier.send(batch_msg)?;
+        self.db_stats.batch_write_queue_depth.increment(1);
+        if let Err(error) = self.write_notifier.send(batch_msg) {
+            self.db_stats.batch_write_queue_depth.increment(-1);
+            return Err(error);
+        }
 
         rx.await?
     }
 
     #[inline]
     pub(crate) async fn maybe_apply_backpressure(&self) -> Result<(), SlateDBError> {
+        let mut backpressure_timer = None;
         loop {
             self.check_closed()?;
             let wal_status = self.wal_observer.status()?;
@@ -371,6 +376,12 @@ impl DbInner {
             );
 
             if total_mem_size_bytes >= self.settings.max_unflushed_bytes {
+                backpressure_timer.get_or_insert_with(|| {
+                    crate::db_stats::ActiveDurationGuard::new(
+                        self.db_stats.backpressure_waiters.clone(),
+                        self.db_stats.backpressure_wait_seconds.clone(),
+                    )
+                });
                 self.db_stats.backpressure_count.increment(1);
                 warn!(
                     "unflushed WAL and memtable size exceeds max_unflushed_bytes. applying backpressure. [total_mem_size_bytes={}, active_memtable_size_bytes={}, imm_memtable_size_bytes={}, wal_size_bytes={}, max_unflushed_bytes={}]",
@@ -5635,6 +5646,16 @@ mod tests {
             "expected fenced error, got {:?}",
             backpressure_result
         );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::BACKPRESSURE_WAITERS),
+            Some(0)
+        );
+        let snapshot = metrics_recorder.snapshot();
+        let metrics = snapshot.by_name(crate::db_stats::BACKPRESSURE_WAIT_SECONDS);
+        assert!(matches!(
+            metrics.first().unwrap().value,
+            MetricValue::Histogram { count: 1, .. }
+        ));
     }
 
     #[tokio::test]
@@ -10019,6 +10040,29 @@ mod tests {
             lookup_metric(&metrics_recorder, crate::db_stats::WRITE_BATCH_COUNT),
             Some(2)
         );
+        assert_eq!(
+            lookup_metric(&metrics_recorder, crate::db_stats::BATCH_WRITE_QUEUE_DEPTH),
+            Some(0)
+        );
+        assert_eq!(
+            lookup_metric(
+                &metrics_recorder,
+                crate::db_stats::BATCH_WRITE_SERVICE_ACTIVE
+            ),
+            Some(0)
+        );
+        for metric_name in [
+            crate::db_stats::BATCH_WRITE_QUEUE_WAIT_SECONDS,
+            crate::db_stats::BATCH_WRITE_SERVICE_SECONDS,
+        ] {
+            let snapshot = metrics_recorder.snapshot();
+            let metrics = snapshot.by_name(metric_name);
+            let metric = metrics.first().unwrap();
+            assert!(matches!(
+                metric.value,
+                MetricValue::Histogram { count: 2, .. }
+            ));
+        }
         db.close().await.unwrap();
     }
 

@@ -30,6 +30,7 @@ use fail_parallel::fail_point;
 use futures::stream::BoxStream;
 use futures::{FutureExt, StreamExt};
 use std::sync::Arc;
+use std::time::Instant;
 use tracing::instrument;
 
 use crate::config::WriteOptions;
@@ -76,6 +77,7 @@ pub(crate) struct WriteBatchRequest {
     /// transfers from the caller to the writer. `None` for
     /// non-transactional writes. Fix for #1732.
     pub(crate) txn: Option<DbTransaction>,
+    pub(crate) enqueued_at: Instant,
 }
 
 impl std::fmt::Debug for BatchWriterMessage {
@@ -119,7 +121,17 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
                 options,
                 done,
                 txn,
+                enqueued_at,
             }) => {
+                self.db_inner.db_stats.batch_write_queue_depth.increment(-1);
+                self.db_inner
+                    .db_stats
+                    .batch_write_queue_wait_seconds
+                    .record(enqueued_at.elapsed().as_secs_f64());
+                let _service_timer = crate::db_stats::ActiveDurationGuard::new(
+                    self.db_inner.db_stats.batch_write_service_active.clone(),
+                    self.db_inner.db_stats.batch_write_service_seconds.clone(),
+                );
                 let wal_writer = self.wal_writer.as_deref_mut();
                 let result = self
                     .db_inner
@@ -168,6 +180,11 @@ impl MessageHandler<BatchWriterMessage> for WriteBatchEventHandler {
         while let Some(msg) = messages.next().await {
             match msg {
                 BatchWriterMessage::WriteBatch(req) => {
+                    self.db_inner.db_stats.batch_write_queue_depth.increment(-1);
+                    self.db_inner
+                        .db_stats
+                        .batch_write_queue_wait_seconds
+                        .record(req.enqueued_at.elapsed().as_secs_f64());
                     let _ = req.done.send(Err(error.clone()));
                 }
                 BatchWriterMessage::Flush(flush_msg) => {
@@ -576,6 +593,7 @@ mod tests {
                 options,
                 done,
                 txn: None,
+                enqueued_at: Instant::now(),
             }),
             rx,
         )

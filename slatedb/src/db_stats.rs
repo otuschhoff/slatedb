@@ -1,5 +1,8 @@
-use slatedb_common::metrics::{CounterFn, GaugeFn, MetricsRecorderHelper};
+use slatedb_common::metrics::{
+    CounterFn, GaugeFn, HistogramFn, MetricsRecorderHelper, UpDownCounterFn, LATENCY_BOUNDARIES,
+};
 use std::sync::Arc;
+use std::time::Instant;
 
 pub use crate::merge_operator::MERGE_OPERATOR_OPERANDS;
 
@@ -18,6 +21,12 @@ pub const REQUEST_COUNT: &str = db_stat_name!("request_count");
 pub const WRITE_OPS: &str = db_stat_name!("write_ops");
 pub const WRITE_BATCH_COUNT: &str = db_stat_name!("write_batch_count");
 pub const BACKPRESSURE_COUNT: &str = db_stat_name!("backpressure_count");
+pub const BACKPRESSURE_WAITERS: &str = db_stat_name!("backpressure_waiters");
+pub const BACKPRESSURE_WAIT_SECONDS: &str = db_stat_name!("backpressure_wait_seconds");
+pub const BATCH_WRITE_QUEUE_DEPTH: &str = db_stat_name!("batch_write_queue_depth");
+pub const BATCH_WRITE_QUEUE_WAIT_SECONDS: &str = db_stat_name!("batch_write_queue_wait_seconds");
+pub const BATCH_WRITE_SERVICE_ACTIVE: &str = db_stat_name!("batch_write_service_active");
+pub const BATCH_WRITE_SERVICE_SECONDS: &str = db_stat_name!("batch_write_service_seconds");
 pub const L0_STALL_COUNT: &str = db_stat_name!("l0_stall_count");
 pub const L0_STALL_TYPE_LABEL: &str = "type";
 pub const L0_STALL_TYPE_NUM_SSTS: &str = "num_ssts";
@@ -60,6 +69,12 @@ pub(crate) struct DbStatsInner {
     pub(crate) sst_filter_range_positives: Arc<dyn CounterFn>,
     pub(crate) sst_filter_range_negatives: Arc<dyn CounterFn>,
     pub(crate) backpressure_count: Arc<dyn CounterFn>,
+    pub(crate) backpressure_waiters: Arc<dyn UpDownCounterFn>,
+    pub(crate) backpressure_wait_seconds: Arc<dyn HistogramFn>,
+    pub(crate) batch_write_queue_depth: Arc<dyn UpDownCounterFn>,
+    pub(crate) batch_write_queue_wait_seconds: Arc<dyn HistogramFn>,
+    pub(crate) batch_write_service_active: Arc<dyn UpDownCounterFn>,
+    pub(crate) batch_write_service_seconds: Arc<dyn HistogramFn>,
     pub(crate) l0_stall_count_num_ssts: Arc<dyn CounterFn>,
     pub(crate) l0_stall_count_num_ssts_per_key: Arc<dyn CounterFn>,
     pub(crate) get_requests: Arc<dyn CounterFn>,
@@ -135,6 +150,20 @@ impl DbStats {
                 .labels(&[(FILTER_KIND_LABEL, FILTER_KIND_RANGE)])
                 .register(),
             backpressure_count: recorder.counter(BACKPRESSURE_COUNT).register(),
+            backpressure_waiters: recorder.up_down_counter(BACKPRESSURE_WAITERS).register(),
+            backpressure_wait_seconds: recorder
+                .histogram(BACKPRESSURE_WAIT_SECONDS, LATENCY_BOUNDARIES)
+                .register(),
+            batch_write_queue_depth: recorder.up_down_counter(BATCH_WRITE_QUEUE_DEPTH).register(),
+            batch_write_queue_wait_seconds: recorder
+                .histogram(BATCH_WRITE_QUEUE_WAIT_SECONDS, LATENCY_BOUNDARIES)
+                .register(),
+            batch_write_service_active: recorder
+                .up_down_counter(BATCH_WRITE_SERVICE_ACTIVE)
+                .register(),
+            batch_write_service_seconds: recorder
+                .histogram(BATCH_WRITE_SERVICE_SECONDS, LATENCY_BOUNDARIES)
+                .register(),
             l0_stall_count_num_ssts: recorder
                 .counter(L0_STALL_COUNT)
                 .labels(&[(L0_STALL_TYPE_LABEL, L0_STALL_TYPE_NUM_SSTS)])
@@ -180,5 +209,29 @@ impl DbStats {
         DbStats {
             inner: Arc::new(inner),
         }
+    }
+}
+
+pub(crate) struct ActiveDurationGuard {
+    active: Arc<dyn UpDownCounterFn>,
+    duration: Arc<dyn HistogramFn>,
+    started: Instant,
+}
+
+impl ActiveDurationGuard {
+    pub(crate) fn new(active: Arc<dyn UpDownCounterFn>, duration: Arc<dyn HistogramFn>) -> Self {
+        active.increment(1);
+        Self {
+            active,
+            duration,
+            started: Instant::now(),
+        }
+    }
+}
+
+impl Drop for ActiveDurationGuard {
+    fn drop(&mut self) {
+        self.duration.record(self.started.elapsed().as_secs_f64());
+        self.active.increment(-1);
     }
 }
