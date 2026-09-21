@@ -465,6 +465,10 @@ impl Reader {
         write_batch: Option<&WriteBatch>,
         max_seq: Option<u64>,
     ) -> Result<Vec<Option<RowEntry>>, SlateDBError> {
+        self.db_stats.multi_get_calls.increment(1);
+        self.db_stats
+            .multi_get_input_keys
+            .increment(keys.len() as u64);
         if keys.is_empty() {
             return Ok(Vec::new());
         }
@@ -490,6 +494,7 @@ impl Reader {
             orig_to_unique.push(u);
         }
         let n = unique_keys.len();
+        self.db_stats.multi_get_unique_keys.increment(n as u64);
 
         // Per unique key: write-batch entries (unfiltered, highest precedence),
         // everything-else entries (memtable + on-disk), and whether a base
@@ -562,6 +567,9 @@ impl Reader {
         //    Memtable entries are already in `acc` and stay first (they are
         //    newer than anything on disk).
         let work = build_sst_work(db_state.core(), &unique_keys, &resolved);
+        self.db_stats
+            .multi_get_sst_visits
+            .increment(work.len() as u64);
         if !work.is_empty() {
             let max_parallel = work.len().clamp(1, MAX_CONCURRENT_SST_READS);
             let table_store = self.table_store.clone();
@@ -1087,8 +1095,8 @@ mod tests {
     use crate::tablestore::{TableStore, TableStoreKind};
     use object_store::{memory::InMemory, path::Path, ObjectStore};
     use slatedb_common::metrics::{
-        lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricsRecorder,
-        MetricsRecorderHelper,
+        lookup_metric_with_labels, DefaultMetricsRecorder, MetricLevel, MetricValue,
+        MetricsRecorder, MetricsRecorderHelper,
     };
     use std::collections::HashMap;
     use std::sync::Arc;
@@ -1939,10 +1947,31 @@ mod tests {
         max_seq: Option<u64>,
         merge: bool,
     ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
+        run_multi_get_with_recorder(
+            entries,
+            query_keys,
+            dirty,
+            last_committed_seq,
+            max_seq,
+            merge,
+            MetricsRecorderHelper::noop(),
+        )
+        .await
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn run_multi_get_with_recorder(
+        entries: Vec<TestEntry>,
+        query_keys: &[&'static [u8]],
+        dirty: bool,
+        last_committed_seq: Option<u64>,
+        max_seq: Option<u64>,
+        merge: bool,
+        recorder: MetricsRecorderHelper,
+    ) -> Result<Vec<Option<Bytes>>, SlateDBError> {
         let mut test_db_state = TestDbState::new().await;
         let write_batch = populate_db_state(&mut test_db_state, entries).await?;
 
-        let recorder = MetricsRecorderHelper::noop();
         let db_stats = DbStats::new(&recorder);
         let test_clock = Arc::new(MockSystemClock::new());
         let mono_clock = Arc::new(MonotonicClock::new(test_clock as Arc<dyn SystemClock>, 0));
@@ -2050,6 +2079,43 @@ mod tests {
         assert_eq!(vals[1].as_deref(), Some(b"v2".as_ref()));
         assert_eq!(vals[2].as_deref(), Some(b"v1".as_ref())); // duplicate slot
         assert_eq!(vals[3], None);
+        Ok(())
+    }
+
+    #[tokio::test]
+    async fn test_multi_get_records_read_amplification() -> Result<(), SlateDBError> {
+        let recorder = Arc::new(DefaultMetricsRecorder::new());
+        let helper = MetricsRecorderHelper::new(recorder.clone(), MetricLevel::default());
+        let vals = run_multi_get_with_recorder(
+            vec![
+                TestEntry::value(b"key1", b"v1", 50).with_location(LayerLocation::L0Sst(0)),
+                TestEntry::value(b"key2", b"v2", 51).with_location(LayerLocation::L0Sst(0)),
+            ],
+            &[b"key1", b"key2", b"key1", b"absent"],
+            true,
+            None,
+            None,
+            false,
+            helper,
+        )
+        .await?;
+        assert_eq!(vals[0].as_deref(), Some(b"v1".as_ref()));
+
+        let metrics = recorder.snapshot();
+        for (name, expected) in [
+            (crate::db_stats::MULTI_GET_CALLS, 1),
+            (crate::db_stats::MULTI_GET_INPUT_KEYS, 4),
+            (crate::db_stats::MULTI_GET_UNIQUE_KEYS, 3),
+            (crate::db_stats::MULTI_GET_SST_VISITS, 1),
+            (crate::db_stats::MULTI_GET_CANDIDATE_KEYS, 2),
+            (crate::db_stats::MULTI_GET_NEEDED_BLOCKS, 1),
+            (crate::db_stats::MULTI_GET_COALESCED_READS, 1),
+        ] {
+            let MetricValue::Counter(actual) = metrics.by_name(name)[0].value else {
+                panic!("{name} is not a counter");
+            };
+            assert_eq!(actual, expected, "unexpected {name}");
+        }
         Ok(())
     }
 

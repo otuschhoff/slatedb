@@ -63,6 +63,13 @@ pub const L0_FLUSH_BYTES: &str = db_stat_name!("l0_flush_bytes");
 pub const SST_FILTER_FALSE_POSITIVE_COUNT: &str = db_stat_name!("sst_filter_false_positive_count");
 pub const SST_FILTER_POSITIVE_COUNT: &str = db_stat_name!("sst_filter_positive_count");
 pub const SST_FILTER_NEGATIVE_COUNT: &str = db_stat_name!("sst_filter_negative_count");
+pub const MULTI_GET_CALLS: &str = db_stat_name!("multi_get_calls");
+pub const MULTI_GET_INPUT_KEYS: &str = db_stat_name!("multi_get_input_keys");
+pub const MULTI_GET_UNIQUE_KEYS: &str = db_stat_name!("multi_get_unique_keys");
+pub const MULTI_GET_SST_VISITS: &str = db_stat_name!("multi_get_sst_visits");
+pub const MULTI_GET_CANDIDATE_KEYS: &str = db_stat_name!("multi_get_candidate_keys");
+pub const MULTI_GET_NEEDED_BLOCKS: &str = db_stat_name!("multi_get_needed_blocks");
+pub const MULTI_GET_COALESCED_READS: &str = db_stat_name!("multi_get_coalesced_reads");
 /// Size of key value pairs inserted into the memtable after batch merge operators and overwrites
 /// are collapsed.
 /// Use as denominator to calculate write amplification:
@@ -88,6 +95,13 @@ pub(crate) struct DbStatsInner {
     pub(crate) sst_filter_range_false_positives: Arc<dyn CounterFn>,
     pub(crate) sst_filter_range_positives: Arc<dyn CounterFn>,
     pub(crate) sst_filter_range_negatives: Arc<dyn CounterFn>,
+    pub(crate) multi_get_calls: Arc<dyn CounterFn>,
+    pub(crate) multi_get_input_keys: Arc<dyn CounterFn>,
+    pub(crate) multi_get_unique_keys: Arc<dyn CounterFn>,
+    pub(crate) multi_get_sst_visits: Arc<dyn CounterFn>,
+    pub(crate) multi_get_candidate_keys: Arc<dyn CounterFn>,
+    pub(crate) multi_get_needed_blocks: Arc<dyn CounterFn>,
+    pub(crate) multi_get_coalesced_reads: Arc<dyn CounterFn>,
     pub(crate) backpressure_count: Arc<dyn CounterFn>,
     pub(crate) backpressure_lifecycle: Arc<ActiveDurationLifecycle>,
     pub(crate) backpressure_timeout_count: Arc<dyn CounterFn>,
@@ -197,6 +211,13 @@ impl DbStats {
                 .counter(SST_FILTER_NEGATIVE_COUNT)
                 .labels(&[(FILTER_KIND_LABEL, FILTER_KIND_RANGE)])
                 .register(),
+            multi_get_calls: recorder.counter(MULTI_GET_CALLS).register(),
+            multi_get_input_keys: recorder.counter(MULTI_GET_INPUT_KEYS).register(),
+            multi_get_unique_keys: recorder.counter(MULTI_GET_UNIQUE_KEYS).register(),
+            multi_get_sst_visits: recorder.counter(MULTI_GET_SST_VISITS).register(),
+            multi_get_candidate_keys: recorder.counter(MULTI_GET_CANDIDATE_KEYS).register(),
+            multi_get_needed_blocks: recorder.counter(MULTI_GET_NEEDED_BLOCKS).register(),
+            multi_get_coalesced_reads: recorder.counter(MULTI_GET_COALESCED_READS).register(),
             backpressure_count: recorder.counter(BACKPRESSURE_COUNT).register(),
             backpressure_lifecycle,
             backpressure_timeout_count: recorder

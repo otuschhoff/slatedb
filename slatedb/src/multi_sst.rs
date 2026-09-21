@@ -89,6 +89,11 @@ pub(crate) async fn read_sst_for_keys(
     let candidates = plan_candidates(
         view, keys, &index, &filters, options, read_trace, sst_level, db_stats,
     );
+    if let Some(stats) = db_stats {
+        stats
+            .multi_get_candidate_keys
+            .increment(candidates.len() as u64);
+    }
     if candidates.is_empty() {
         return Ok(Vec::new());
     }
@@ -100,6 +105,7 @@ pub(crate) async fn read_sst_for_keys(
         options.cache_blocks,
         options.segment.clone(),
         table_store,
+        db_stats,
     )
     .await?;
 
@@ -201,6 +207,7 @@ async fn fetch_candidate_blocks(
     cache_blocks: bool,
     segment: Option<Bytes>,
     table_store: &Arc<TableStore>,
+    db_stats: Option<&DbStats>,
 ) -> Result<BTreeMap<usize, Arc<Block>>, SlateDBError> {
     let mut needed: Vec<usize> = Vec::new();
     for cand in candidates {
@@ -208,9 +215,16 @@ async fn fetch_candidate_blocks(
     }
     needed.sort_unstable();
     needed.dedup();
+    if let Some(stats) = db_stats {
+        stats.multi_get_needed_blocks.increment(needed.len() as u64);
+    }
 
     let mut blocks: BTreeMap<usize, Arc<Block>> = BTreeMap::new();
-    for run in coalesce_runs(&needed, COALESCE_GAP_BLOCKS) {
+    let runs = coalesce_runs(&needed, COALESCE_GAP_BLOCKS);
+    if let Some(stats) = db_stats {
+        stats.multi_get_coalesced_reads.increment(runs.len() as u64);
+    }
+    for run in runs {
         let fetched = table_store
             .read_blocks_using_index(
                 handle,
