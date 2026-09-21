@@ -2116,6 +2116,35 @@ mod tests {
             };
             assert_eq!(actual, expected, "unexpected {name}");
         }
+        let counter = |name| {
+            let MetricValue::Counter(actual) = metrics.by_name(name)[0].value else {
+                panic!("{name} is not a counter");
+            };
+            actual
+        };
+        let needed_bytes = counter(crate::db_stats::MULTI_GET_NEEDED_BLOCK_BYTES);
+        assert!(needed_bytes > 0);
+        assert_eq!(
+            counter(crate::db_stats::MULTI_GET_COALESCED_READ_BYTES),
+            needed_bytes
+        );
+        for (reads, bytes) in [
+            (
+                crate::db_stats::MULTI_GET_PROJECTED_READS_GAP_8,
+                crate::db_stats::MULTI_GET_PROJECTED_READ_BYTES_GAP_8,
+            ),
+            (
+                crate::db_stats::MULTI_GET_PROJECTED_READS_GAP_32,
+                crate::db_stats::MULTI_GET_PROJECTED_READ_BYTES_GAP_32,
+            ),
+            (
+                crate::db_stats::MULTI_GET_PROJECTED_READS_GAP_128,
+                crate::db_stats::MULTI_GET_PROJECTED_READ_BYTES_GAP_128,
+            ),
+        ] {
+            assert_eq!(counter(reads), 1, "unexpected {reads}");
+            assert_eq!(counter(bytes), needed_bytes, "unexpected {bytes}");
+        }
         Ok(())
     }
 

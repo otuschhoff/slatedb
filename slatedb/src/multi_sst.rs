@@ -220,9 +220,50 @@ async fn fetch_candidate_blocks(
     }
 
     let mut blocks: BTreeMap<usize, Arc<Block>> = BTreeMap::new();
+    let block_offsets = {
+        let index = index.borrow();
+        (0..index.block_meta().len())
+            .map(|block| index.block_meta().get(block).offset())
+            .collect::<Vec<_>>()
+    };
+    let data_end = if handle.info.filter_len > 0 {
+        handle.info.filter_offset
+    } else {
+        handle.info.index_offset
+    };
+    if let Some(stats) = db_stats {
+        let needed_runs = coalesce_runs(&needed, 0);
+        stats
+            .multi_get_needed_block_bytes
+            .increment(projected_read_bytes(&needed_runs, &block_offsets, data_end));
+    }
     let runs = coalesce_runs(&needed, COALESCE_GAP_BLOCKS);
     if let Some(stats) = db_stats {
         stats.multi_get_coalesced_reads.increment(runs.len() as u64);
+        stats
+            .multi_get_coalesced_read_bytes
+            .increment(projected_read_bytes(&runs, &block_offsets, data_end));
+        for (gap, reads, bytes) in [
+            (
+                8,
+                &stats.multi_get_projected_reads_gap_8,
+                &stats.multi_get_projected_read_bytes_gap_8,
+            ),
+            (
+                32,
+                &stats.multi_get_projected_reads_gap_32,
+                &stats.multi_get_projected_read_bytes_gap_32,
+            ),
+            (
+                128,
+                &stats.multi_get_projected_reads_gap_128,
+                &stats.multi_get_projected_read_bytes_gap_128,
+            ),
+        ] {
+            let projected = coalesce_runs(&needed, gap);
+            reads.increment(projected.len() as u64);
+            bytes.increment(projected_read_bytes(&projected, &block_offsets, data_end));
+        }
     }
     for run in runs {
         let fetched = table_store
@@ -315,6 +356,15 @@ fn coalesce_runs(sorted_blocks: &[usize], gap: usize) -> Vec<Range<usize>> {
     runs
 }
 
+fn projected_read_bytes(runs: &[Range<usize>], block_offsets: &[u64], data_end: u64) -> u64 {
+    runs.iter()
+        .map(|run| {
+            let end = block_offsets.get(run.end).copied().unwrap_or(data_end);
+            end - block_offsets[run.start]
+        })
+        .sum()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -335,5 +385,22 @@ mod tests {
         assert_eq!(coalesce_runs(&[0, 2], 1), vec![0..3]);
         // One intervening block at gap=0 splits.
         assert_eq!(coalesce_runs(&[0, 2], 0), vec![0..1, 2..3]);
+    }
+
+    #[test]
+    fn projected_read_bytes_counts_absorbed_blocks() {
+        let offsets = [0, 10, 30, 60, 100, 150, 210];
+        let needed = [0, 2, 6];
+
+        let current = coalesce_runs(&needed, 2);
+        assert_eq!(current, vec![0..3, 6..7]);
+        assert_eq!(projected_read_bytes(&current, &offsets, 280), 130);
+
+        let wider = coalesce_runs(&needed, 8);
+        assert_eq!(wider, vec![0..7]);
+        assert_eq!(projected_read_bytes(&wider, &offsets, 280), 280);
+
+        let needed_runs = coalesce_runs(&needed, 0);
+        assert_eq!(projected_read_bytes(&needed_runs, &offsets, 280), 110);
     }
 }

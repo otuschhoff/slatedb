@@ -70,6 +70,19 @@ pub const MULTI_GET_SST_VISITS: &str = db_stat_name!("multi_get_sst_visits");
 pub const MULTI_GET_CANDIDATE_KEYS: &str = db_stat_name!("multi_get_candidate_keys");
 pub const MULTI_GET_NEEDED_BLOCKS: &str = db_stat_name!("multi_get_needed_blocks");
 pub const MULTI_GET_COALESCED_READS: &str = db_stat_name!("multi_get_coalesced_reads");
+pub const MULTI_GET_NEEDED_BLOCK_BYTES: &str = db_stat_name!("multi_get_needed_block_bytes");
+pub const MULTI_GET_COALESCED_READ_BYTES: &str = db_stat_name!("multi_get_coalesced_read_bytes");
+pub const MULTI_GET_PROJECTED_READS_GAP_8: &str = db_stat_name!("multi_get_projected_reads_gap_8");
+pub const MULTI_GET_PROJECTED_READ_BYTES_GAP_8: &str =
+    db_stat_name!("multi_get_projected_read_bytes_gap_8");
+pub const MULTI_GET_PROJECTED_READS_GAP_32: &str =
+    db_stat_name!("multi_get_projected_reads_gap_32");
+pub const MULTI_GET_PROJECTED_READ_BYTES_GAP_32: &str =
+    db_stat_name!("multi_get_projected_read_bytes_gap_32");
+pub const MULTI_GET_PROJECTED_READS_GAP_128: &str =
+    db_stat_name!("multi_get_projected_reads_gap_128");
+pub const MULTI_GET_PROJECTED_READ_BYTES_GAP_128: &str =
+    db_stat_name!("multi_get_projected_read_bytes_gap_128");
 /// Size of key value pairs inserted into the memtable after batch merge operators and overwrites
 /// are collapsed.
 /// Use as denominator to calculate write amplification:
@@ -102,6 +115,14 @@ pub(crate) struct DbStatsInner {
     pub(crate) multi_get_candidate_keys: Arc<dyn CounterFn>,
     pub(crate) multi_get_needed_blocks: Arc<dyn CounterFn>,
     pub(crate) multi_get_coalesced_reads: Arc<dyn CounterFn>,
+    pub(crate) multi_get_needed_block_bytes: Arc<dyn CounterFn>,
+    pub(crate) multi_get_coalesced_read_bytes: Arc<dyn CounterFn>,
+    pub(crate) multi_get_projected_reads_gap_8: Arc<dyn CounterFn>,
+    pub(crate) multi_get_projected_read_bytes_gap_8: Arc<dyn CounterFn>,
+    pub(crate) multi_get_projected_reads_gap_32: Arc<dyn CounterFn>,
+    pub(crate) multi_get_projected_read_bytes_gap_32: Arc<dyn CounterFn>,
+    pub(crate) multi_get_projected_reads_gap_128: Arc<dyn CounterFn>,
+    pub(crate) multi_get_projected_read_bytes_gap_128: Arc<dyn CounterFn>,
     pub(crate) backpressure_count: Arc<dyn CounterFn>,
     pub(crate) backpressure_lifecycle: Arc<ActiveDurationLifecycle>,
     pub(crate) backpressure_timeout_count: Arc<dyn CounterFn>,
@@ -218,6 +239,28 @@ impl DbStats {
             multi_get_candidate_keys: recorder.counter(MULTI_GET_CANDIDATE_KEYS).register(),
             multi_get_needed_blocks: recorder.counter(MULTI_GET_NEEDED_BLOCKS).register(),
             multi_get_coalesced_reads: recorder.counter(MULTI_GET_COALESCED_READS).register(),
+            multi_get_needed_block_bytes: recorder.counter(MULTI_GET_NEEDED_BLOCK_BYTES).register(),
+            multi_get_coalesced_read_bytes: recorder
+                .counter(MULTI_GET_COALESCED_READ_BYTES)
+                .register(),
+            multi_get_projected_reads_gap_8: recorder
+                .counter(MULTI_GET_PROJECTED_READS_GAP_8)
+                .register(),
+            multi_get_projected_read_bytes_gap_8: recorder
+                .counter(MULTI_GET_PROJECTED_READ_BYTES_GAP_8)
+                .register(),
+            multi_get_projected_reads_gap_32: recorder
+                .counter(MULTI_GET_PROJECTED_READS_GAP_32)
+                .register(),
+            multi_get_projected_read_bytes_gap_32: recorder
+                .counter(MULTI_GET_PROJECTED_READ_BYTES_GAP_32)
+                .register(),
+            multi_get_projected_reads_gap_128: recorder
+                .counter(MULTI_GET_PROJECTED_READS_GAP_128)
+                .register(),
+            multi_get_projected_read_bytes_gap_128: recorder
+                .counter(MULTI_GET_PROJECTED_READ_BYTES_GAP_128)
+                .register(),
             backpressure_count: recorder.counter(BACKPRESSURE_COUNT).register(),
             backpressure_lifecycle,
             backpressure_timeout_count: recorder
