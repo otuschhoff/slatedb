@@ -1,4 +1,5 @@
 use async_trait::async_trait;
+use futures::future::BoxFuture;
 use std::collections::VecDeque;
 
 use crate::error::SlateDBError;
@@ -64,8 +65,14 @@ impl<'a> RowEntryIterator for Box<dyn RowEntryIterator + 'a> {
         self.as_mut().init().await
     }
 
-    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        self.as_mut().next().await
+    fn next<'next, 'async_trait>(
+        &'next mut self,
+    ) -> BoxFuture<'async_trait, Result<Option<RowEntry>, SlateDBError>>
+    where
+        'next: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.as_mut().next()
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
@@ -79,8 +86,14 @@ impl<'a> RowEntryIterator for Box<dyn TrackedRowEntryIterator + 'a> {
         self.as_mut().init().await
     }
 
-    async fn next(&mut self) -> Result<Option<RowEntry>, SlateDBError> {
-        self.as_mut().next().await
+    fn next<'next, 'async_trait>(
+        &'next mut self,
+    ) -> BoxFuture<'async_trait, Result<Option<RowEntry>, SlateDBError>>
+    where
+        'next: 'async_trait,
+        Self: 'async_trait,
+    {
+        self.as_mut().next()
     }
 
     async fn seek(&mut self, next_key: &[u8]) -> Result<(), SlateDBError> {
@@ -158,5 +171,140 @@ impl RowEntryIterator for VecRowIterator {
             }
         }
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::future::Future;
+    use std::pin::Pin;
+    use std::sync::atomic::{AtomicUsize, Ordering};
+    use std::task::{Context, Poll};
+
+    struct ProbeIterator<'a> {
+        address: &'a AtomicUsize,
+        polls: &'a AtomicUsize,
+        drops: &'a AtomicUsize,
+    }
+
+    struct ProbeFuture<'a> {
+        polls: &'a AtomicUsize,
+        drops: &'a AtomicUsize,
+        pending: bool,
+    }
+
+    impl Future for ProbeFuture<'_> {
+        type Output = Result<Option<RowEntry>, SlateDBError>;
+
+        fn poll(mut self: Pin<&mut Self>, context: &mut Context<'_>) -> Poll<Self::Output> {
+            self.polls.fetch_add(1, Ordering::SeqCst);
+            if self.pending {
+                self.pending = false;
+                context.waker().wake_by_ref();
+                Poll::Pending
+            } else {
+                Poll::Ready(Err(SlateDBError::IteratorNotInitialized))
+            }
+        }
+    }
+
+    impl Drop for ProbeFuture<'_> {
+        fn drop(&mut self) {
+            self.drops.fetch_add(1, Ordering::SeqCst);
+        }
+    }
+
+    #[async_trait]
+    impl RowEntryIterator for ProbeIterator<'_> {
+        async fn init(&mut self) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+
+        fn next<'next, 'async_trait>(
+            &'next mut self,
+        ) -> BoxFuture<'async_trait, Result<Option<RowEntry>, SlateDBError>>
+        where
+            'next: 'async_trait,
+            Self: 'async_trait,
+        {
+            let future = Box::pin(ProbeFuture {
+                polls: self.polls,
+                drops: self.drops,
+                pending: true,
+            });
+            self.address.store(
+                future.as_ref().get_ref() as *const _ as usize,
+                Ordering::SeqCst,
+            );
+            future
+        }
+
+        async fn seek(&mut self, _next_key: &[u8]) -> Result<(), SlateDBError> {
+            Ok(())
+        }
+    }
+
+    impl TrackedRowEntryIterator for ProbeIterator<'_> {
+        fn bytes_processed(&self) -> u64 {
+            7
+        }
+    }
+
+    async fn assert_next_forwarding(
+        iterator: &mut impl RowEntryIterator,
+        address: &AtomicUsize,
+        polls: &AtomicUsize,
+        drops: &AtomicUsize,
+    ) {
+        for cancel in [true, false] {
+            let mut future = iterator.next();
+            assert_eq!(
+                future.as_ref().get_ref() as *const _ as *const () as usize,
+                address.load(Ordering::SeqCst),
+            );
+            assert_eq!(polls.load(Ordering::SeqCst), usize::from(!cancel));
+            assert!(futures::poll!(future.as_mut()).is_pending());
+            if cancel {
+                drop(future);
+            } else {
+                assert!(matches!(
+                    future.await,
+                    Err(SlateDBError::IteratorNotInitialized)
+                ));
+            }
+        }
+        assert_eq!(polls.load(Ordering::SeqCst), 3);
+        assert_eq!(drops.load(Ordering::SeqCst), 2);
+    }
+
+    #[tokio::test]
+    async fn boxed_next_forwards_future_without_reboxing() {
+        let address = AtomicUsize::new(0);
+        let polls = AtomicUsize::new(0);
+        let drops = AtomicUsize::new(0);
+        let inner: Box<dyn RowEntryIterator + '_> = Box::new(ProbeIterator {
+            address: &address,
+            polls: &polls,
+            drops: &drops,
+        });
+        let mut iterator: Box<dyn RowEntryIterator + '_> = Box::new(inner);
+        assert_next_forwarding(&mut iterator, &address, &polls, &drops).await;
+    }
+
+    #[tokio::test]
+    async fn tracked_boxed_next_forwards_future_without_reboxing() {
+        let address = AtomicUsize::new(0);
+        let polls = AtomicUsize::new(0);
+        let drops = AtomicUsize::new(0);
+        let inner: Box<dyn TrackedRowEntryIterator + '_> = Box::new(ProbeIterator {
+            address: &address,
+            polls: &polls,
+            drops: &drops,
+        });
+        let mut iterator: Box<dyn TrackedRowEntryIterator + '_> = Box::new(inner);
+        assert_eq!(iterator.bytes_processed(), 7);
+        assert_next_forwarding(&mut iterator, &address, &polls, &drops).await;
+        assert_eq!(iterator.bytes_processed(), 7);
     }
 }
