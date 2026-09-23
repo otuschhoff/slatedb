@@ -157,9 +157,15 @@ impl<'a> MergeIterator<'a> {
             let current_kv = iterator_state.next_kv;
             if let Some(kv) = iterator_state.iterator.next().await? {
                 iterator_state.next_kv = kv;
-                self.iterators.push(Reverse(iterator_state));
+                if let Some(mut first) = self.iterators.peek_mut() {
+                    if first.0 <= iterator_state {
+                        std::mem::swap(&mut first.0, &mut iterator_state);
+                    }
+                }
+                self.current = Some(iterator_state);
+            } else {
+                self.current = self.iterators.pop().map(|r| r.0);
             }
-            self.current = self.iterators.pop().map(|r| r.0);
 
             // Track bytes processed for progress reporting
             let entry_bytes = current_kv.key.len() as u64 + current_kv.value.len() as u64;
@@ -247,6 +253,128 @@ mod tests {
     use crate::types::RowEntry;
     use std::collections::VecDeque;
     use std::vec;
+
+    #[tokio::test]
+    async fn merge_matches_sorted_reference_across_streams() {
+        use crate::iter::TrackedRowEntryIterator;
+        use crate::types::ValueDeletable;
+
+        for streams in [1, 6, 32] {
+            for descending in [false, true] {
+                for dedup in [false, true] {
+                    let mut inputs = Vec::new();
+                    let mut reference = Vec::new();
+                    for stream in 0..streams {
+                        let mut rows = Vec::new();
+                        for ordinal in 0..97u64 {
+                            let key = ordinal.to_be_bytes();
+                            let seq = (streams - stream) as u64;
+                            let row = match (ordinal + stream as u64) % 3 {
+                                0 => RowEntry::new_value(&key, b"value", seq),
+                                1 => RowEntry::new_merge(&key, b"merge", seq),
+                                _ => RowEntry::new_tombstone(&key, seq),
+                            };
+                            rows.push(row);
+                        }
+                        if descending {
+                            rows.reverse();
+                        }
+                        reference.extend(rows.iter().cloned());
+                        let mut input = TestIterator::new();
+                        for row in rows {
+                            input = input.with_row_entry(row);
+                        }
+                        inputs.push(input);
+                    }
+                    inputs.push(TestIterator::new());
+                    reference.sort_by(|left, right| {
+                        let keys = if descending {
+                            right.key.cmp(&left.key)
+                        } else {
+                            left.key.cmp(&right.key)
+                        };
+                        keys.then_with(|| right.seq.cmp(&left.seq))
+                    });
+                    let bytes: u64 = reference
+                        .iter()
+                        .map(|row| (row.key.len() + row.value.len()) as u64)
+                        .sum();
+                    if dedup {
+                        let mut barrier = None;
+                        reference.retain(|row| {
+                            if barrier.as_ref() == Some(&row.key) {
+                                return false;
+                            }
+                            if !matches!(row.value, ValueDeletable::Merge(_)) {
+                                barrier = Some(row.key.clone());
+                            }
+                            true
+                        });
+                    }
+                    let order = if descending {
+                        IterationOrder::Descending
+                    } else {
+                        IterationOrder::Ascending
+                    };
+                    let mut merged = MergeIterator::new_with_order(inputs, order)
+                        .unwrap()
+                        .with_dedup(dedup);
+                    merged.init().await.unwrap();
+                    for expected in reference {
+                        assert_eq!(merged.next().await.unwrap(), Some(expected));
+                    }
+                    assert_eq!(merged.next().await.unwrap(), None);
+                    assert_eq!(merged.bytes_processed(), bytes);
+                }
+            }
+        }
+    }
+
+    #[tokio::test]
+    #[ignore]
+    async fn merge_iterator_throughput_probe() {
+        use std::hint::black_box;
+        use std::time::Instant;
+
+        for streams in [1, 6, 32] {
+            for disjoint in [false, true] {
+                let rows_per_stream = 120_000 / streams;
+                let mut timings = Vec::new();
+                for _round in 0..11 {
+                    let mut inputs = Vec::new();
+                    for stream in 0..streams {
+                        let mut input = TestIterator::new();
+                        for ordinal in 0..rows_per_stream {
+                            let index = if disjoint {
+                                stream * rows_per_stream + ordinal
+                            } else {
+                                ordinal * streams + stream
+                            };
+                            let mut key = [0u8; 34];
+                            key[..2].copy_from_slice(b"b:");
+                            key[2..10].copy_from_slice(&(index as u64).to_be_bytes());
+                            input = input.with_row_entry(RowEntry::new_value(&key, &[7; 56], 1));
+                        }
+                        inputs.push(input);
+                    }
+                    let mut merged = MergeIterator::new(inputs).unwrap();
+                    merged.init().await.unwrap();
+                    let start = Instant::now();
+                    let mut count = 0;
+                    while let Some(row) = merged.next().await.unwrap() {
+                        black_box(row);
+                        count += 1;
+                    }
+                    let elapsed = start.elapsed();
+                    assert_eq!(count, streams * rows_per_stream);
+                    timings.push(elapsed.as_nanos() as f64 / count as f64);
+                }
+                timings.remove(0);
+                timings.sort_by(f64::total_cmp);
+                println!("streams={streams} disjoint={disjoint} median_ns_per_row={:.2} min={:.2} max={:.2}", (timings[4] + timings[5]) / 2.0, timings[0], timings[9]);
+            }
+        }
+    }
 
     #[tokio::test]
     async fn test_merge_iterator_should_include_entries_in_order() {
